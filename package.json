@@ -1,0 +1,35 @@
+{
+  "name": "pi-dictate",
+  "version": "0.1.0",
+  "description": "Local WhisperX speech-to-text dictation for Pi.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Federico Cervelli <federicocervelli01@gmail.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Federicocervelli/pi-dictate.git"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "dictate"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-tui": "0.80.10",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.5.0"
+  }
+}
