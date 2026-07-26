@@ -146,14 +146,16 @@ export default function (pi: ExtensionAPI) {
     activeCtx.ui.notify("Dictation finished but no input field is focused", "warning");
   };
 
-  const stopOwnedServiceIfIdle = async () => {
+  const stopServiceIfIdle = async (): Promise<boolean> => {
     try {
       const response = await fetch(`${WHISPER_SERVER}/health`);
       const status = await response.json() as { active_sessions?: number };
-      if (response.ok && status.active_sessions === 0) {
-        await pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"]);
-      }
-    } catch {}
+      if (!response.ok || status.active_sessions !== 0) return false;
+      const result = await pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"]);
+      return result.code === 0;
+    } catch {
+      return false;
+    }
   };
 
   const cleanup = () => {
@@ -171,7 +173,7 @@ export default function (pi: ExtensionAPI) {
     streamReady = null;
     if (serviceOwned) {
       serviceOwned = false;
-      void stopOwnedServiceIfIdle();
+      void stopServiceIfIdle();
     }
     state = "idle";
     setStatus(undefined);
@@ -377,8 +379,8 @@ export default function (pi: ExtensionAPI) {
       }
       if (action === "off") {
         cleanup();
-        const result = await pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"], { timeout: 30_000 });
-        ctx.ui.notify(result.code === 0 ? "Local dictation stopped" : `Could not stop local dictation: ${result.stderr}`, result.code === 0 ? "info" : "error");
+        const stopped = await stopServiceIfIdle();
+        ctx.ui.notify(stopped ? "Local dictation stopped" : "Local dictation kept running because another process is using it", stopped ? "info" : "warning");
         return;
       }
       if (action === "status") {
