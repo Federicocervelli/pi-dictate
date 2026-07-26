@@ -72,8 +72,6 @@ export default function (pi: ExtensionAPI) {
   let meterRemainder: Buffer = Buffer.alloc(0);
   let streamSession: string | null = null;
   let streamBuffer = Buffer.alloc(0);
-  let streamText = "";
-  let streamPreview: { editor?: EditorLike; base: string; rendered: string } | null = null;
   let streamQueue = Promise.resolve();
   let streamAbort: AbortController | null = null;
 
@@ -157,64 +155,16 @@ export default function (pi: ExtensionAPI) {
     streamAbort = null;
     streamSession = null;
     streamBuffer = Buffer.alloc(0);
-    streamText = "";
-    streamPreview = null;
     streamQueue = Promise.resolve();
     state = "idle";
     setStatus(undefined);
     activeCtx = null;
   };
 
-  const updatePreview = (text: string) => {
-    if (!streamPreview || !text) return;
-    const preview = streamPreview;
-    if (preview.editor) {
-      const current = preview.editor.getText() ?? "";
-      if (current !== preview.rendered) {
-        streamPreview = null;
-        return;
-      }
-      const separator = preview.base && !/\s$/.test(preview.base) ? " " : "";
-      preview.rendered = preview.base + separator + text;
-      preview.editor.setText(preview.rendered);
-      tuiHandle?.requestRender?.();
-    } else {
-      const current = activeCtx?.ui.getEditorText() ?? "";
-      if (current !== preview.rendered) {
-        streamPreview = null;
-        return;
-      }
-      const separator = preview.base && !/\s$/.test(preview.base) ? " " : "";
-      preview.rendered = preview.base + separator + text;
-      activeCtx?.ui.setEditorText(preview.rendered);
-    }
-  };
-
   const finish = (text?: string) => {
-    if (text && streamPreview) {
-      const preview = streamPreview;
-      if (preview.editor) {
-        const current = preview.editor.getText() ?? "";
-        if (current === preview.rendered) {
-          preview.editor.setText(preview.base + (preview.base && !/\s$/.test(preview.base) ? " " : "") + text);
-          tuiHandle?.requestRender?.();
-        } else {
-          insert(text);
-        }
-      } else {
-        const current = activeCtx?.ui.getEditorText() ?? "";
-        if (current === preview.rendered) {
-          activeCtx?.ui.setEditorText(preview.base + (preview.base && !/\s$/.test(preview.base) ? " " : "") + text);
-        } else {
-          insert(text);
-        }
-      }
-    } else if (text) {
-      insert(text);
-    }
+    if (text) insert(text);
     cleanup();
   };
-
   const startStream = async (myGeneration: number) => {
     streamAbort = new AbortController();
     const response = await fetch(`${WHISPER_SERVER}/stream/start`, {
@@ -235,12 +185,8 @@ export default function (pi: ExtensionAPI) {
         body: chunk,
         signal: streamAbort?.signal,
       });
-      const result = await response.json() as { text?: string; error?: string };
+      const result = await response.json() as { error?: string };
       if (!response.ok) throw new Error(result.error ?? response.statusText);
-      if (streamSession === session && result.text !== undefined) {
-        streamText = result.text;
-        updatePreview(streamText);
-      }
     });
   };
 
@@ -248,12 +194,6 @@ export default function (pi: ExtensionAPI) {
     activeCtx = ctx;
     state = "recording";
     const myGeneration = ++generation;
-    const target = tuiHandle ? resolveTarget() : null;
-    if (target?.kind === "editor") streamPreview = { editor: target.editor, base: target.editor.getText() ?? "", rendered: target.editor.getText() ?? "" };
-    else if (!tuiHandle) {
-      const base = ctx.ui.getEditorText() ?? "";
-      streamPreview = { base, rendered: base };
-    }
     startMeter();
     try {
       await startStream(myGeneration);
@@ -302,7 +242,7 @@ export default function (pi: ExtensionAPI) {
     if (state !== "recording" || !recorder) return;
     state = "transcribing";
     stopMeter();
-    setStatus(undefined);
+    startSpinner("transcribing locally…");
     const myGeneration = generation;
     const proc = recorder;
     await new Promise<void>((resolve) => {
