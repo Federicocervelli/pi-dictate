@@ -262,10 +262,16 @@ export default function (pi: ExtensionAPI) {
       try {
         await ensureServerReady();
         await startStream(myGeneration);
-        if (myGeneration !== generation || state !== "recording") return;
+        if (myGeneration !== generation || state !== "recording") {
+          if (serviceOwned) {
+            serviceOwned = false;
+            await pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"]);
+          }
+          return;
+        }
         queueAvailableAudio(streamSession!);
       } catch (error: any) {
-        if (myGeneration !== generation) return;
+        if (myGeneration !== generation || state !== "recording") return;
         ctx.ui.notify(`Could not start local dictation: ${error.message}`, "error");
         cleanup();
       }
@@ -286,7 +292,11 @@ export default function (pi: ExtensionAPI) {
       try { proc.kill("SIGINT"); } catch { resolve(); }
     });
     if (ready) await ready;
-    if (myGeneration !== generation || !streamSession) return;
+    if (myGeneration !== generation) return;
+    if (!streamSession) {
+      cleanup();
+      return;
+    }
     try {
       if (streamBuffer.length) {
         sendStreamChunk(streamSession, streamBuffer);
