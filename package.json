@@ -1,7 +1,7 @@
 {
   "name": "pi-dictate",
   "version": "0.1.0",
-  "description": "Local WhisperX speech-to-text dictation for Pi.",
+  "description": "Local Moonshine speech-to-text dictation for Pi.",
   "type": "module",
   "license": "MIT",
   "author": "Federico Cervelli <federicocervelli01@gmail.com>",

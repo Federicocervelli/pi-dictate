@@ -1,8 +1,8 @@
-# Local WhisperX dictation for pi
+# Local Moonshine dictation for pi
 
-Offline speech-to-text dictation for pi. The WhisperX server is **off by default** and holds no RAM or VRAM when stopped.
+Offline, CPU-only speech-to-text dictation for pi. The Moonshine server is **off by default** and holds no RAM when stopped.
 
-- `/tts on` — start the local WhisperX server and load the model into GPU memory.
+- `/tts on` — start the local Moonshine server.
 - `/tts off` — cancel dictation if needed, stop the server, and release its RAM/VRAM.
 - `/tts status` — show whether it is running.
 - `alt+m` — start/stop recording (after `/tts on`).

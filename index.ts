@@ -1,5 +1,5 @@
 /**
- * Offline WhisperX dictation for pi.
+ * Offline Moonshine streaming dictation for pi.
  * alt+m starts/stops recording; alt+n cancels.
  */
 
@@ -14,8 +14,9 @@ const dbg = (message: string) => {
   if (DEBUG) appendFileSync("/tmp/dictate-debug.log", `${new Date().toISOString()} ${message}\n`);
 };
 
-// A local systemd user service keeps the WhisperX model warm in GPU memory.
-const WHISPERX_SERVER = "http://127.0.0.1:8765";
+// A local systemd user service keeps the CPU speech model warm.
+const WHISPER_SERVER = "http://127.0.0.1:8765";
+const STREAM_CHUNK_BYTES = 16_000; // 0.5 seconds of 16 kHz, mono, s16le PCM.
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const PEAK_BLOCKS = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
@@ -56,39 +57,25 @@ function rmsToBlock(rms: number): string {
   return PEAK_BLOCKS[Math.floor(position * (PEAK_BLOCKS.length - 1))]!;
 }
 
-/** Wrap signed 16-bit little-endian mono PCM in a minimal WAV container. */
-function pcm16ToWav(pcm: Buffer): Buffer {
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + pcm.length, 4);
-  header.write("WAVEfmt ", 8);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(1, 22);
-  header.writeUInt32LE(16000, 24);
-  header.writeUInt32LE(32000, 28);
-  header.writeUInt16LE(2, 32);
-  header.writeUInt16LE(16, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(pcm.length, 40);
-  return Buffer.concat([header, pcm]);
-}
-
 export default function (pi: ExtensionAPI) {
   let state: State = "idle";
   let recorder: ChildProcessByStdio<null, Readable, Readable> | null = null;
-  let request: AbortController | null = null;
   let activeCtx: ExtensionContext | null = null;
   let tuiHandle: any = null;
   let removeInputListener: (() => void) | null = null;
   let lastCtx: ExtensionContext | null = null;
   let generation = 0;
-  let chunks: Buffer[] = [];
   let meterTimer: NodeJS.Timeout | null = null;
   let spinnerTimer: NodeJS.Timeout | null = null;
   let meter: number[] = new Array(METER_CELLS).fill(0);
   let level = 0;
   let meterRemainder: Buffer = Buffer.alloc(0);
+  let streamSession: string | null = null;
+  let streamBuffer = Buffer.alloc(0);
+  let streamText = "";
+  let streamPreview: { editor?: EditorLike; base: string; rendered: string } | null = null;
+  let streamQueue = Promise.resolve();
+  let streamAbort: AbortController | null = null;
 
   const setStatus = (text: string | undefined) => activeCtx?.ui.setStatus("dictate", text);
   const stopMeter = () => {
@@ -164,59 +151,113 @@ export default function (pi: ExtensionAPI) {
     stopMeter();
     stopSpinner();
     try { recorder?.kill("SIGKILL"); } catch {}
-    request?.abort();
     recorder = null;
-    request = null;
-    chunks = [];
     meterRemainder = Buffer.alloc(0);
+    streamAbort?.abort();
+    streamAbort = null;
+    streamSession = null;
+    streamBuffer = Buffer.alloc(0);
+    streamText = "";
+    streamPreview = null;
+    streamQueue = Promise.resolve();
     state = "idle";
     setStatus(undefined);
     activeCtx = null;
   };
 
+  const updatePreview = (text: string) => {
+    if (!streamPreview || !text) return;
+    const preview = streamPreview;
+    if (preview.editor) {
+      const current = preview.editor.getText() ?? "";
+      if (current !== preview.rendered) {
+        streamPreview = null;
+        return;
+      }
+      const separator = preview.base && !/\s$/.test(preview.base) ? " " : "";
+      preview.rendered = preview.base + separator + text;
+      preview.editor.setText(preview.rendered);
+      tuiHandle?.requestRender?.();
+    } else {
+      const current = activeCtx?.ui.getEditorText() ?? "";
+      if (current !== preview.rendered) {
+        streamPreview = null;
+        return;
+      }
+      const separator = preview.base && !/\s$/.test(preview.base) ? " " : "";
+      preview.rendered = preview.base + separator + text;
+      activeCtx?.ui.setEditorText(preview.rendered);
+    }
+  };
+
   const finish = (text?: string) => {
-    if (text) insert(text);
+    if (text && streamPreview) {
+      const preview = streamPreview;
+      if (preview.editor) {
+        const current = preview.editor.getText() ?? "";
+        if (current === preview.rendered) {
+          preview.editor.setText(preview.base + (preview.base && !/\s$/.test(preview.base) ? " " : "") + text);
+          tuiHandle?.requestRender?.();
+        } else {
+          insert(text);
+        }
+      } else {
+        const current = activeCtx?.ui.getEditorText() ?? "";
+        if (current === preview.rendered) {
+          activeCtx?.ui.setEditorText(preview.base + (preview.base && !/\s$/.test(preview.base) ? " " : "") + text);
+        } else {
+          insert(text);
+        }
+      }
+    } else if (text) {
+      insert(text);
+    }
     cleanup();
   };
 
-  const transcribe = async (myGeneration: number, pcm: Buffer) => {
-    if (myGeneration !== generation || state !== "transcribing") return;
-    if (!pcm.length) {
-      activeCtx?.ui.notify("No microphone audio captured", "warning");
-      finish();
-      return;
-    }
-    request = new AbortController();
-    try {
-      const response = await fetch(`${WHISPERX_SERVER}/transcribe`, {
-        method: "POST",
-        headers: { "Content-Type": "audio/wav" },
-        body: pcm16ToWav(pcm),
-        signal: request.signal,
-      });
-      const result = await response.json() as { text?: string; error?: string };
-      if (myGeneration !== generation) return;
-      request = null;
-      if (!response.ok) {
-        activeCtx?.ui.notify(`Local WhisperX failed: ${result.error ?? response.statusText}`, "error");
-        finish();
-        return;
-      }
-      finish(result.text?.replace(/\s+/g, " ").trim());
-    } catch (error: any) {
-      if (myGeneration !== generation) return;
-      activeCtx?.ui.notify(`Local WhisperX is unavailable: ${error.message}`, "error");
-      finish();
-    }
+  const startStream = async (myGeneration: number) => {
+    streamAbort = new AbortController();
+    const response = await fetch(`${WHISPER_SERVER}/stream/start`, {
+      method: "POST",
+      signal: streamAbort.signal,
+    });
+    const result = await response.json() as { session?: string; error?: string };
+    if (!response.ok || !result.session) throw new Error(result.error ?? response.statusText);
+    if (myGeneration !== generation || state !== "recording") throw new Error("dictation cancelled");
+    streamSession = result.session;
   };
 
-  const startDictation = (ctx: ExtensionContext) => {
+  const sendStreamChunk = (session: string, chunk: Buffer) => {
+    streamQueue = streamQueue.then(async () => {
+      const response = await fetch(`${WHISPER_SERVER}/stream/audio?session=${session}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/octet-stream" },
+        body: chunk,
+        signal: streamAbort?.signal,
+      });
+      const result = await response.json() as { text?: string; error?: string };
+      if (!response.ok) throw new Error(result.error ?? response.statusText);
+      if (streamSession === session && result.text !== undefined) {
+        streamText = result.text;
+        updatePreview(streamText);
+      }
+    });
+  };
+
+  const startDictation = async (ctx: ExtensionContext) => {
     activeCtx = ctx;
-    chunks = [];
     state = "recording";
     const myGeneration = ++generation;
+    const target = tuiHandle ? resolveTarget() : null;
+    if (target?.kind === "editor") streamPreview = { editor: target.editor, base: target.editor.getText() ?? "", rendered: target.editor.getText() ?? "" };
+    else if (!tuiHandle) {
+      const base = ctx.ui.getEditorText() ?? "";
+      streamPreview = { base, rendered: base };
+    }
     startMeter();
     try {
+      await startStream(myGeneration);
+      if (myGeneration !== generation || state !== "recording") return;
       // PipeWire provides the PulseAudio-compatible local source named "default".
       recorder = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "pulse", "-i", "default", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"], {
         stdio: ["ignore", "pipe", "pipe"],
@@ -229,11 +270,18 @@ export default function (pi: ExtensionAPI) {
     const proc = recorder;
     proc.stdout.on("data", (chunk: Buffer) => {
       if (myGeneration !== generation) return;
-      chunks.push(chunk);
       const meterChunk = meterRemainder.length ? Buffer.concat([meterRemainder, chunk]) : chunk;
       const alignedLength = meterChunk.length - (meterChunk.length % 2);
       meterRemainder = meterChunk.subarray(alignedLength);
       level = rmsFromPcm16(meterChunk.subarray(0, alignedLength));
+      if (streamSession) {
+        streamBuffer = Buffer.concat([streamBuffer, chunk]);
+        while (streamBuffer.length >= STREAM_CHUNK_BYTES) {
+          const audio = streamBuffer.subarray(0, STREAM_CHUNK_BYTES);
+          streamBuffer = streamBuffer.subarray(STREAM_CHUNK_BYTES);
+          sendStreamChunk(streamSession, audio);
+        }
+      }
     });
     proc.once("error", (error) => {
       if (myGeneration !== generation) return;
@@ -250,15 +298,36 @@ export default function (pi: ExtensionAPI) {
     dbg(`recording started (generation ${myGeneration})`);
   };
 
-  const stopDictation = () => {
+  const stopDictation = async () => {
     if (state !== "recording" || !recorder) return;
     state = "transcribing";
     stopMeter();
-    startSpinner("transcribing locally…");
+    setStatus(undefined);
     const myGeneration = generation;
     const proc = recorder;
-    proc.once("close", () => void transcribe(myGeneration, Buffer.concat(chunks)));
-    try { proc.kill("SIGINT"); } catch { void transcribe(myGeneration, Buffer.concat(chunks)); }
+    await new Promise<void>((resolve) => {
+      proc.once("close", () => resolve());
+      try { proc.kill("SIGINT"); } catch { resolve(); }
+    });
+    if (myGeneration !== generation || !streamSession) return;
+    try {
+      if (streamBuffer.length) {
+        sendStreamChunk(streamSession, streamBuffer);
+        streamBuffer = Buffer.alloc(0);
+      }
+      await streamQueue;
+      const response = await fetch(`${WHISPER_SERVER}/stream/stop?session=${streamSession}`, {
+        method: "POST",
+        signal: streamAbort?.signal,
+      });
+      const result = await response.json() as { text?: string; error?: string };
+      if (!response.ok) throw new Error(result.error ?? response.statusText);
+      finish(result.text?.replace(/\s+/g, " ").trim());
+    } catch (error: any) {
+      if (myGeneration !== generation) return;
+      activeCtx?.ui.notify(`Local streaming transcription failed: ${error.message}`, "error");
+      cleanup();
+    }
   };
 
   const toggleDictation = (ctx: ExtensionContext) => {
@@ -270,7 +339,7 @@ export default function (pi: ExtensionAPI) {
       }
       startDictation(ctx);
     } else if (state === "recording") {
-      stopDictation();
+      void stopDictation();
     }
   };
 
@@ -297,27 +366,27 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
-  pi.registerShortcut(Key.alt("m"), { description: "Toggle local WhisperX dictation", handler: async (ctx) => toggleDictation(ctx) });
+  pi.registerShortcut(Key.alt("m"), { description: "Toggle local dictation", handler: async (ctx) => toggleDictation(ctx) });
   pi.registerShortcut(Key.alt("n"), { description: "Cancel local dictation", handler: async () => cleanup() });
 
   pi.registerCommand("tts", {
-    description: "Control local WhisperX: /tts on, off, or status",
+    description: "Control local dictation: /tts on, off, or status",
     handler: async (args, ctx) => {
       const action = args.trim().toLowerCase();
       if (action === "on") {
         const result = await pi.exec("systemctl", ["--user", "start", "pi-dictate.service"], { timeout: 30_000 });
-        ctx.ui.notify(result.code === 0 ? "Local WhisperX started" : `Could not start WhisperX: ${result.stderr}`, result.code === 0 ? "info" : "error");
+        ctx.ui.notify(result.code === 0 ? "Local dictation started" : `Could not start local dictation: ${result.stderr}`, result.code === 0 ? "info" : "error");
         return;
       }
       if (action === "off") {
         cleanup();
         const result = await pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"], { timeout: 30_000 });
-        ctx.ui.notify(result.code === 0 ? "Local WhisperX stopped" : `Could not stop WhisperX: ${result.stderr}`, result.code === 0 ? "info" : "error");
+        ctx.ui.notify(result.code === 0 ? "Local dictation stopped" : `Could not stop local dictation: ${result.stderr}`, result.code === 0 ? "info" : "error");
         return;
       }
       if (action === "status") {
         const result = await pi.exec("systemctl", ["--user", "is-active", "--quiet", "pi-dictate.service"], { timeout: 5_000 });
-        ctx.ui.notify(result.code === 0 ? "Local WhisperX is running" : "Local WhisperX is off", "info");
+        ctx.ui.notify(result.code === 0 ? "Local dictation is running" : "Local dictation is off", "info");
         return;
       }
       ctx.ui.notify("Usage: /tts on | off | status", "info");
