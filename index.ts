@@ -146,6 +146,16 @@ export default function (pi: ExtensionAPI) {
     activeCtx.ui.notify("Dictation finished but no input field is focused", "warning");
   };
 
+  const stopOwnedServiceIfIdle = async () => {
+    try {
+      const response = await fetch(`${WHISPER_SERVER}/health`);
+      const status = await response.json() as { active_sessions?: number };
+      if (response.ok && status.active_sessions === 0) {
+        await pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"]);
+      }
+    } catch {}
+  };
+
   const cleanup = () => {
     generation++;
     stopMeter();
@@ -161,7 +171,7 @@ export default function (pi: ExtensionAPI) {
     streamReady = null;
     if (serviceOwned) {
       serviceOwned = false;
-      void pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"]);
+      void stopOwnedServiceIfIdle();
     }
     state = "idle";
     setStatus(undefined);

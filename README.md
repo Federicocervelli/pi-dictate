@@ -31,7 +31,7 @@ systemctl --user start pi-dictate.service
 curl -fsS http://127.0.0.1:8765/health
 ```
 
-The model is cached under `~/.cache/moonshine_voice/`. The server listens only on localhost and uses no API key or remote inference. Audio is processed in chunks while recording, but text is inserted only after the second `Alt+M`, so cancelling does not leave partial text behind. `Alt+M` starts the service automatically if it is off, buffers microphone audio while the model loads, and stops that service after dictation finishes. `/tts on` keeps it warm; `/tts off` stops it.
+The model is cached under `~/.cache/moonshine_voice/`. The server listens only on localhost and uses no API key or remote inference. Audio is processed in chunks while recording, but text is inserted only after the second `Alt+M`, so cancelling does not leave partial text behind. `Alt+M` starts the service automatically if it is off, buffers microphone audio while the model loads, and stops that service after dictation finishes when no other session is active. Multiple Pi processes can use independent streams from the shared model. `/tts on` keeps it warm; `/tts off` stops it.
 
 ### Agent setup checklist
 
