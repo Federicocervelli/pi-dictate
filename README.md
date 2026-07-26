@@ -23,7 +23,7 @@ uv venv --python 3.10 ~/.local/share/whisperx/.venv
 uv pip install --python ~/.local/share/whisperx/.venv/bin/python moonshine-voice
 ```
 
-This extension uses **Moonshine Small Streaming English**, a quantized ONNX model running on the CPU. Start the service once to download/cache the model and verify it:
+This extension uses **Moonshine Medium Streaming English** (245M parameters), a quantized ONNX model running on the CPU. Start the service once to download/cache the model and verify it:
 
 ```bash
 systemctl --user daemon-reload
