@@ -74,6 +74,8 @@ export default function (pi: ExtensionAPI) {
   let streamBuffer = Buffer.alloc(0);
   let streamQueue = Promise.resolve();
   let streamAbort: AbortController | null = null;
+  let streamReady: Promise<void> | null = null;
+  let serviceOwned = false;
 
   const setStatus = (text: string | undefined) => activeCtx?.ui.setStatus("dictate", text);
   const stopMeter = () => {
@@ -156,6 +158,11 @@ export default function (pi: ExtensionAPI) {
     streamSession = null;
     streamBuffer = Buffer.alloc(0);
     streamQueue = Promise.resolve();
+    streamReady = null;
+    if (serviceOwned) {
+      serviceOwned = false;
+      void pi.exec("systemctl", ["--user", "stop", "pi-dictate.service"]);
+    }
     state = "idle";
     setStatus(undefined);
     activeCtx = null;
@@ -165,6 +172,29 @@ export default function (pi: ExtensionAPI) {
     if (text) insert(text);
     cleanup();
   };
+  const ensureServerReady = async () => {
+    const wasActive = await pi.exec("systemctl", ["--user", "is-active", "--quiet", "pi-dictate.service"], { timeout: 5_000 });
+    serviceOwned = wasActive.code !== 0;
+    const result = await pi.exec("systemctl", ["--user", "start", "pi-dictate.service"], { timeout: 30_000 });
+    if (result.code !== 0) throw new Error(result.stderr || "could not start local dictation service");
+    for (let attempt = 0; attempt < 60; attempt++) {
+      try {
+        const response = await fetch(`${WHISPER_SERVER}/health`);
+        if (response.ok) return;
+      } catch {}
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+    throw new Error("local dictation service did not become ready");
+  };
+
+  const queueAvailableAudio = (session: string) => {
+    while (streamBuffer.length >= STREAM_CHUNK_BYTES) {
+      const audio = streamBuffer.subarray(0, STREAM_CHUNK_BYTES);
+      streamBuffer = streamBuffer.subarray(STREAM_CHUNK_BYTES);
+      sendStreamChunk(session, audio);
+    }
+  };
+
   const startStream = async (myGeneration: number) => {
     streamAbort = new AbortController();
     const response = await fetch(`${WHISPER_SERVER}/stream/start`, {
@@ -194,10 +224,9 @@ export default function (pi: ExtensionAPI) {
     activeCtx = ctx;
     state = "recording";
     const myGeneration = ++generation;
+    streamBuffer = Buffer.alloc(0);
     startMeter();
     try {
-      await startStream(myGeneration);
-      if (myGeneration !== generation || state !== "recording") return;
       // PipeWire provides the PulseAudio-compatible local source named "default".
       recorder = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "pulse", "-i", "default", "-ac", "1", "-ar", "16000", "-f", "s16le", "pipe:1"], {
         stdio: ["ignore", "pipe", "pipe"],
@@ -214,14 +243,8 @@ export default function (pi: ExtensionAPI) {
       const alignedLength = meterChunk.length - (meterChunk.length % 2);
       meterRemainder = meterChunk.subarray(alignedLength);
       level = rmsFromPcm16(meterChunk.subarray(0, alignedLength));
-      if (streamSession) {
-        streamBuffer = Buffer.concat([streamBuffer, chunk]);
-        while (streamBuffer.length >= STREAM_CHUNK_BYTES) {
-          const audio = streamBuffer.subarray(0, STREAM_CHUNK_BYTES);
-          streamBuffer = streamBuffer.subarray(STREAM_CHUNK_BYTES);
-          sendStreamChunk(streamSession, audio);
-        }
-      }
+      streamBuffer = Buffer.concat([streamBuffer, chunk]);
+      if (streamSession) queueAvailableAudio(streamSession);
     });
     proc.once("error", (error) => {
       if (myGeneration !== generation) return;
@@ -235,6 +258,18 @@ export default function (pi: ExtensionAPI) {
         cleanup();
       }
     });
+    streamReady = (async () => {
+      try {
+        await ensureServerReady();
+        await startStream(myGeneration);
+        if (myGeneration !== generation || state !== "recording") return;
+        queueAvailableAudio(streamSession!);
+      } catch (error: any) {
+        if (myGeneration !== generation) return;
+        ctx.ui.notify(`Could not start local dictation: ${error.message}`, "error");
+        cleanup();
+      }
+    })();
     dbg(`recording started (generation ${myGeneration})`);
   };
 
@@ -245,10 +280,12 @@ export default function (pi: ExtensionAPI) {
     startSpinner("transcribing locally…");
     const myGeneration = generation;
     const proc = recorder;
+    const ready = streamReady;
     await new Promise<void>((resolve) => {
       proc.once("close", () => resolve());
       try { proc.kill("SIGINT"); } catch { resolve(); }
     });
+    if (ready) await ready;
     if (myGeneration !== generation || !streamSession) return;
     try {
       if (streamBuffer.length) {
